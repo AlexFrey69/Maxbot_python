@@ -1,580 +1,266 @@
 import asyncio
-import json
-import logging
-import os
-import re
-
-import aiosqlite
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from dotenv import load_dotenv
+import random
+import sqlite3
 
 from maxapi import Bot, Dispatcher
-from maxapi.filters import F
-from maxapi.types import (
-    CallbackButton,
-    Command,
-    CommandStart,
-    MessageCallback,
-    MessageCreated,
-)
-from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
+from maxapi.types import MessageCreated, ButtonsPayload, MessageButton
 
-# =========================================================
-# CONFIG
-# =========================================================
+TOKEN = "f9LHodD0cOIiRXBXlK0fq37l43RGqQrTVLy8yjP4s1bHMAz-jpy3GTIBzWP0XBiixmxtx59r2czgSq2DNiKn"
 
-logging.basicConfig(level=logging.INFO)
-
-load_dotenv()
-
-BOT_TOKEN = "f9LHodD0cOIiRXBXlK0fq37l43RGqQrTVLy8yjP4s1bHMAz-jpy3GTIBzWP0XBiixmxtx59r2czgSq2DNiKn"
-
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN not found")
-
-bot = Bot(BOT_TOKEN)
+bot = Bot(TOKEN)
 dp = Dispatcher()
 
-scheduler = AsyncIOScheduler()
+# =========================
+# DB
+# =========================
 
-DB_NAME = "fitness.db"
+db = sqlite3.connect("fitness_bot.db")
+cursor = db.cursor()
 
-TIME_PATTERN = r"^([01]\d|2[0-3]):([0-5]\d)$"
+cursor.execute("DROP TABLE IF EXISTS workouts")
 
-# =========================================================
-# MEMORY
-# =========================================================
+cursor.execute("""
+CREATE TABLE workouts(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    title TEXT,
+    exercises TEXT
+)
+""")
 
-user_states = {}
-user_workouts = {}
+db.commit()
 
-# =========================================================
-# EXERCISES
-# =========================================================
+# =========================
+# DATA
+# =========================
 
-EXERCISES = {
-    "stretch": "Растяжка",
-    "cardio": "Кардио",
-    "strength": "Силовые упражнения",
-    "breathing": "Дыхательные упражнения",
-    "back": "Спина и осанка",
-    "legs": "Ноги",
-    "abs": "Пресс",
-}
+EXERCISES = [
+    "Прыжки — 30 сек",
+    "Приседания — 20 раз",
+    "Планка — 40 сек",
+    "Отжимания — 15 раз",
+    "Выпады — 20 раз",
+    "Бег на месте — 1 мин",
+    "Растяжка — 1 мин",
+    "Скручивания — 20 раз",
+]
 
-# =========================================================
-# DATABASE
-# =========================================================
+states = {}
+temp_data = {}
 
-
-async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS reminders (
-            user_id INTEGER PRIMARY KEY,
-            reminder_time TEXT
-        )
-        """)
-
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS workouts (
-            user_id INTEGER,
-            exercises TEXT
-        )
-        """)
-
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS stats (
-            user_id INTEGER PRIMARY KEY,
-            completed INTEGER DEFAULT 0
-        )
-        """)
-
-        await db.commit()
-
-
-# =========================================================
+# =========================
 # KEYBOARDS
-# =========================================================
+# =========================
 
-def main_keyboard():
-    builder = InlineKeyboardBuilder()
+def main_menu():
+    return ButtonsPayload(
+        buttons=[
+            [MessageButton(text="Подобрать зарядку")],
+            [MessageButton(text="Создать свою зарядку")],
+            [MessageButton(text="Мои тренировки")],
+            [MessageButton(text="Изменить тренировку")],
+            [MessageButton(text="Удалить тренировку")],
+            [MessageButton(text="Мой прогресс")]
+        ]
+    ).pack()
 
-    builder.row(
-        CallbackButton(
-            text="Подобрать зарядку",
-            payload="select_workout"
+
+def workout_menu():
+    return ButtonsPayload(
+        buttons=[
+            [MessageButton(text="Раннее утро")],
+            [MessageButton(text="Утро")],
+            [MessageButton(text="Позднее утро")],
+            [MessageButton(text="Назад")]
+        ]
+    ).pack()
+
+# =========================
+# WORKOUT LOGIC
+# =========================
+
+def generate_workout_by_count(count: int):
+    selected = random.sample(EXERCISES, min(count, len(EXERCISES)))
+
+    text = "Зарядка:\n\n"
+    for i, ex in enumerate(selected, 1):
+        text += f"{i}. {ex}\n"
+    return text
+
+
+def workout_by_time(label: str):
+    if label == "Раннее утро":
+        return generate_workout_by_count(6)
+    elif label == "Утро":
+        return generate_workout_by_count(4)
+    elif label == "Позднее утро":
+        return generate_workout_by_count(2)
+    return "Ошибка выбора"
+
+# =========================
+# HANDLER
+# =========================
+
+@dp.message_created()
+async def handler(event: MessageCreated):
+
+    user_id = event.from_user.user_id
+    text = event.message.body.text
+
+    # START
+    if text.lower() in ["/start", "start", "главное меню"]:
+        await event.message.answer("Главное меню", attachments=[main_menu()])
+
+    # WORKOUT MENU
+    elif text == "Подобрать зарядку":
+        await event.message.answer("Выберите время:", attachments=[workout_menu()])
+
+    elif text in ["Раннее утро", "Утро", "Позднее утро"]:
+        await event.message.answer(workout_by_time(text), attachments=[main_menu()])
+
+    # CREATE
+    elif text == "Создать свою зарядку":
+        states[user_id] = "create_title"
+        await event.message.answer("Введите название")
+
+    elif states.get(user_id) == "create_title":
+        temp_data[user_id] = {"title": text}
+        states[user_id] = "create_exercises"
+        await event.message.answer("Введите упражнения через запятую")
+
+    elif states.get(user_id) == "create_exercises":
+        cursor.execute(
+            "INSERT INTO workouts(user_id, title, exercises) VALUES (?, ?, ?)",
+            (user_id, temp_data[user_id]["title"], text)
         )
-    )
+        db.commit()
 
-    builder.row(
-        CallbackButton(
-            text="Создать свою зарядку",
-            payload="create_workout"
-        )
-    )
+        states[user_id] = None
+        await event.message.answer("Сохранено", attachments=[main_menu()])
 
-    builder.row(
-        CallbackButton(
-            text="Напоминания",
-            payload="reminder"
-        )
-    )
+    # MY WORKOUTS
+    elif text == "Мои тренировки":
+        cursor.execute("SELECT id, title, exercises FROM workouts WHERE user_id=?", (user_id,))
+        data = cursor.fetchall()
 
-    builder.row(
-        CallbackButton(
-            text="Мой прогресс",
-            payload="stats"
-        )
-    )
+        if not data:
+            await event.message.answer("Нет тренировок", attachments=[main_menu()])
+            return
 
-    return builder.as_markup()
+        msg = "Мои тренировки:\n\n"
+        for i, (wid, t, e) in enumerate(data, 1):
+            msg += f"{i}. {t}\n{e}\n\n"
 
+        await event.message.answer(msg, attachments=[main_menu()])
 
-def wakeup_keyboard():
-    builder = InlineKeyboardBuilder()
+    # DELETE
+    elif text == "Удалить тренировку":
+        cursor.execute("SELECT id, title FROM workouts WHERE user_id=?", (user_id,))
+        data = cursor.fetchall()
 
-    builder.row(
-        CallbackButton(
-            text="5:00 - 7:00",
-            payload="wake_early"
-        )
-    )
+        if not data:
+            await event.message.answer("Нет тренировок", attachments=[main_menu()])
+            return
 
-    builder.row(
-        CallbackButton(
-            text="8:00 - 10:00",
-            payload="wake_medium"
-        )
-    )
+        temp_data[user_id] = {"delete_list": data}
+        states[user_id] = "delete_select"
 
-    builder.row(
-        CallbackButton(
-            text="После 10:00",
-            payload="wake_late"
-        )
-    )
+        msg = "Выберите номер для удаления:\n\n"
+        for i, (_, title) in enumerate(data, 1):
+            msg += f"{i}. {title}\n"
 
-    builder.row(
-        CallbackButton(
-            text="Назад",
-            payload="back"
-        )
-    )
+        await event.message.answer(msg)
 
-    return builder.as_markup()
+    elif states.get(user_id) == "delete_select":
+        try:
+            index = int(text) - 1
+            data = temp_data[user_id]["delete_list"]
+            workout_id = data[index][0]
 
+            cursor.execute("DELETE FROM workouts WHERE id=?", (workout_id,))
+            db.commit()
 
-def exercises_keyboard():
-    builder = InlineKeyboardBuilder()
+            states[user_id] = None
+            temp_data.pop(user_id, None)
 
-    for key, value in EXERCISES.items():
+            await event.message.answer("Удалено", attachments=[main_menu()])
+        except:
+            await event.message.answer("Ошибка выбора")
 
-        builder.row(
-            CallbackButton(
-                text=value,
-                payload=f"exercise_{key}"
-            )
-        )
+    # EDIT WORKOUT
+    elif text == "Изменить тренировку":
+        cursor.execute("SELECT id, title FROM workouts WHERE user_id=?", (user_id,))
+        data = cursor.fetchall()
 
-    builder.row(
-        CallbackButton(
-            text="Сохранить",
-            payload="save_workout"
-        )
-    )
+        if not data:
+            await event.message.answer("Нет тренировок", attachments=[main_menu()])
+            return
 
-    builder.row(
-        CallbackButton(
-            text="Назад",
-            payload="back"
-        )
-    )
+        temp_data[user_id] = {"edit_list": data}
+        states[user_id] = "edit_select"
 
-    return builder.as_markup()
+        msg = "Выберите номер тренировки для изменения:\n\n"
+        for i, (_, title) in enumerate(data, 1):
+            msg += f"{i}. {title}\n"
 
+        await event.message.answer(msg)
 
-# =========================================================
-# REMINDERS
-# =========================================================
+    elif states.get(user_id) == "edit_select":
+        try:
+            index = int(text) - 1
+            data = temp_data[user_id]["edit_list"]
 
-async def send_reminder(user_id: int):
+            workout_id = data[index][0]
+            temp_data[user_id]["edit_id"] = workout_id
 
-    try:
+            states[user_id] = "edit_title"
+            await event.message.answer("Введите новое название")
+        except:
+            await event.message.answer("Ошибка выбора")
 
-        await bot.send_message(
-            chat_id=user_id,
-            text="Пора сделать зарядку"
-        )
+    elif states.get(user_id) == "edit_title":
+        temp_data[user_id]["new_title"] = text
+        states[user_id] = "edit_exercises"
+        await event.message.answer("Введите новые упражнения через запятую")
 
-    except Exception as error:
-        print(error)
+    elif states.get(user_id) == "edit_exercises":
+        cursor.execute("""
+            UPDATE workouts
+            SET title=?, exercises=?
+            WHERE id=?
+        """, (
+            temp_data[user_id]["new_title"],
+            text,
+            temp_data[user_id]["edit_id"]
+        ))
 
+        db.commit()
 
-async def load_reminders():
+        states[user_id] = None
+        temp_data.pop(user_id, None)
 
-    async with aiosqlite.connect(DB_NAME) as db:
+        await event.message.answer("Изменено", attachments=[main_menu()])
 
-        async with db.execute(
-            "SELECT user_id, reminder_time FROM reminders"
-        ) as cursor:
+    # PROGRESS
+    elif text == "Мой прогресс":
+        cursor.execute("SELECT COUNT(*) FROM workouts WHERE user_id=?", (user_id,))
+        count = cursor.fetchone()[0]
 
-            reminders = await cursor.fetchall()
-
-            for user_id, reminder_time in reminders:
-
-                hour, minute = map(
-                    int,
-                    reminder_time.split(":")
-                )
-
-                scheduler.add_job(
-                    send_reminder,
-                    "cron",
-                    hour=hour,
-                    minute=minute,
-                    args=[user_id],
-                    id=f"reminder_{user_id}",
-                    replace_existing=True
-                )
-
-
-# =========================================================
-# STATS
-# =========================================================
-
-async def increase_stats(user_id):
-
-    async with aiosqlite.connect(DB_NAME) as db:
-
-        cursor = await db.execute(
-            "SELECT completed FROM stats WHERE user_id = ?",
-            (user_id,)
+        await event.message.answer(
+            f"Тренировок: {count}",
+            attachments=[main_menu()]
         )
 
-        row = await cursor.fetchone()
-
-        if row:
-
-            await db.execute(
-                """
-                UPDATE stats
-                SET completed = completed + 1
-                WHERE user_id = ?
-                """,
-                (user_id,)
-            )
-
-        else:
-
-            await db.execute(
-                """
-                INSERT INTO stats (user_id, completed)
-                VALUES (?, 1)
-                """,
-                (user_id,)
-            )
-
-        await db.commit()
+    elif text == "Назад":
+        await event.message.answer("Меню", attachments=[main_menu()])
 
 
-# =========================================================
+# =========================
 # START
-# =========================================================
-
-@dp.message_created(CommandStart())
-@dp.message_created(Command("start"))
-async def start(event: MessageCreated):
-
-    await event.message.answer(
-        (
-            "Фитнес-бот\n\n"
-            "Функции:\n"
-            "- подбор зарядки\n"
-            "- создание своей тренировки\n"
-            "- напоминания\n"
-            "- статистика"
-        ),
-        attachments=[main_keyboard()]
-    )
-
-
-# =========================================================
-# CALLBACKS
-# =========================================================
-
-@dp.message_callback()
-async def callbacks(event: MessageCallback):
-
-    payload = event.callback.payload
-    user_id = event.from_user.user_id
-
-    # =====================================================
-    # BACK
-    # =====================================================
-
-    if payload == "back":
-
-        await event.message.answer(
-            "Главное меню",
-            attachments=[main_keyboard()]
-        )
-
-    # =====================================================
-    # WORKOUT SELECTION
-    # =====================================================
-
-    elif payload == "select_workout":
-
-        await event.message.answer(
-            "Во сколько вы обычно просыпаетесь?",
-            attachments=[wakeup_keyboard()]
-        )
-
-    elif payload == "wake_early":
-
-        await event.message.answer(
-            (
-                "Рекомендуется интенсивная зарядка\n\n"
-                "Длительность: 30-40 минут\n"
-                "Тип:\n"
-                "- кардио\n"
-                "- силовые упражнения\n"
-                "- растяжка"
-            ),
-            attachments=[main_keyboard()]
-        )
-
-    elif payload == "wake_medium":
-
-        await event.message.answer(
-            (
-                "Рекомендуется средняя нагрузка\n\n"
-                "Длительность: 15-25 минут\n"
-                "Тип:\n"
-                "- разминка\n"
-                "- лёгкое кардио\n"
-                "- суставная гимнастика"
-            ),
-            attachments=[main_keyboard()]
-        )
-
-    elif payload == "wake_late":
-
-        await event.message.answer(
-            (
-                "Рекомендуется лёгкая зарядка\n\n"
-                "Длительность: 10-15 минут\n"
-                "Тип:\n"
-                "- растяжка\n"
-                "- дыхательные упражнения\n"
-                "- мягкая разминка"
-            ),
-            attachments=[main_keyboard()]
-        )
-
-    # =====================================================
-    # CREATE WORKOUT
-    # =====================================================
-
-    elif payload == "create_workout":
-
-        user_workouts[user_id] = []
-
-        await event.message.answer(
-            "Выберите упражнения",
-            attachments=[exercises_keyboard()]
-        )
-
-    elif payload.startswith("exercise_"):
-
-        exercise = payload.replace("exercise_", "")
-
-        if exercise not in user_workouts[user_id]:
-            user_workouts[user_id].append(exercise)
-
-        await event.message.answer(
-            f"Добавлено: {EXERCISES[exercise]}",
-            attachments=[exercises_keyboard()]
-        )
-
-    elif payload == "save_workout":
-
-        exercises = user_workouts.get(user_id)
-
-        if not exercises:
-
-            await event.message.answer(
-                "Вы не выбрали упражнения",
-                attachments=[main_keyboard()]
-            )
-
-            return
-
-        async with aiosqlite.connect(DB_NAME) as db:
-
-            await db.execute(
-                """
-                INSERT INTO workouts (user_id, exercises)
-                VALUES (?, ?)
-                """,
-                (
-                    user_id,
-                    json.dumps(exercises)
-                )
-            )
-
-            await db.commit()
-
-        await increase_stats(user_id)
-
-        result = "\n".join(
-            f"- {EXERCISES[item]}"
-            for item in exercises
-        )
-
-        await event.message.answer(
-            (
-                "Тренировка сохранена\n\n"
-                f"{result}"
-            ),
-            attachments=[main_keyboard()]
-        )
-
-    # =====================================================
-    # REMINDERS
-    # =====================================================
-
-    elif payload == "reminder":
-
-        user_states[user_id] = "waiting_time"
-
-        await event.message.answer(
-            (
-                "Введите время напоминания\n\n"
-                "Пример: 07:30"
-            )
-        )
-
-    # =====================================================
-    # STATS
-    # =====================================================
-
-    elif payload == "stats":
-
-        async with aiosqlite.connect(DB_NAME) as db:
-
-            cursor = await db.execute(
-                """
-                SELECT completed
-                FROM stats
-                WHERE user_id = ?
-                """,
-                (user_id,)
-            )
-
-            row = await cursor.fetchone()
-
-        completed = row[0] if row else 0
-
-        await event.message.answer(
-            (
-                "Статистика\n\n"
-                f"Тренировок выполнено: {completed}"
-            ),
-            attachments=[main_keyboard()]
-        )
-
-
-# =========================================================
-# TEXT
-# =========================================================
-
-@dp.message_created(F.message.body.text)
-async def text_handler(event: MessageCreated):
-
-    user_id = event.from_user.user_id
-    text = event.message.body.text.strip()
-
-    state = user_states.get(user_id)
-
-    # =====================================================
-    # REMINDER TIME
-    # =====================================================
-
-    if state == "waiting_time":
-
-        if not re.match(TIME_PATTERN, text):
-
-            await event.message.answer(
-                "Введите время в формате 07:30"
-            )
-
-            return
-
-        async with aiosqlite.connect(DB_NAME) as db:
-
-            await db.execute(
-                """
-                INSERT OR REPLACE INTO reminders (
-                    user_id,
-                    reminder_time
-                )
-                VALUES (?, ?)
-                """,
-                (user_id, text)
-            )
-
-            await db.commit()
-
-        hour, minute = map(int, text.split(":"))
-
-        scheduler.add_job(
-            send_reminder,
-            "cron",
-            hour=hour,
-            minute=minute,
-            args=[user_id],
-            id=f"reminder_{user_id}",
-            replace_existing=True
-        )
-
-        user_states[user_id] = None
-
-        await event.message.answer(
-            f"Напоминание установлено на {text}",
-            attachments=[main_keyboard()]
-        )
-
-        return
-
-    # =====================================================
-    # DEFAULT
-    # =====================================================
-
-    await event.message.answer(
-        "Используйте кнопки меню",
-        attachments=[main_keyboard()]
-    )
-
-
-# =========================================================
-# MAIN
-# =========================================================
+# =========================
 
 async def main():
-
-    print("Bot started")
-
-    await init_db()
-
-    scheduler.start()
-
-    await load_reminders()
-
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
